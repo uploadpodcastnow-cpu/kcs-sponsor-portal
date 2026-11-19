@@ -122,6 +122,7 @@ function isEpisodeDay(s) { var d = parseD(s).getDay(); return d === 1 || d === 3
 
 /* ------------------------------------------------------------------ storage */
 var API = window.KCS_API_URL || '', KEY = window.KCS_API_KEY || '';
+var CAN_UPLOAD = !API; // the Apps Script store keeps no files: proof screenshots are added as a link there
 var LS_DATA = 'kcs_portal_data_v1';
 var saveState = 'idle', saveTimer = null, dirty = false, lastError = '';
 function api(body) {
@@ -845,9 +846,10 @@ var MODALS = {
     return '<h3>Mark done</h3><p style="margin:0 0 12px"><b>' + esc(taskTitle(t)) + '</b>' + (sponsor(t.sponsorId) ? ' · ' + esc(sponsor(t.sponsorId).name) : '') + '</p>' +
       '<p class="k-note" style="margin:0 0 12px">Add proof it went out: a link to the post, or a screenshot for stories and email newsletters' + (wantShot ? ' (a screenshot is usual for this one)' : '') + '.</p>' +
       '<label class="k-field"><span>Link to the post or episode</span><input class="k-in" name="url" placeholder="https://…" value="' + esc((t.proof && t.proof.url) || '') + '"' + (wantShot ? '' : ' autofocus') + '></label>' +
-      '<label class="k-field" style="margin-top:12px"><span>Screenshot</span><input class="k-in" type="file" accept="image/*" name="shot" data-act="proof-file"></label>' +
+      (CAN_UPLOAD ? '<label class="k-field" style="margin-top:12px"><span>Screenshot</span><input class="k-in" type="file" accept="image/*" name="shot" data-act="proof-file"></label>' +
       '<div id="k-shot-prev" style="margin-top:8px">' + (a.image ? '<img src="' + esc(a.image) + '" style="max-width:100%;max-height:220px;border-radius:6px;border:1px solid var(--line)">' : '') + '</div>' +
-      '<p class="k-note" style="margin:6px 0 0">Tip: you can also paste a screenshot straight into this box (Ctrl/⌘+V).</p>' +
+      '<p class="k-note" style="margin:6px 0 0">Tip: you can also paste a screenshot straight into this box (Ctrl/⌘+V).</p>'
+      : '<p class="k-note" style="margin:8px 0 0">For a story or newsletter, save the screenshot to the sponsor\'s Drive folder and paste its share link above.</p>') +
       '<label class="k-field" style="margin-top:12px"><span>Note (optional)</span><input class="k-in" name="note"></label>' +
       '<div class="k-mfoot"><button class="k-btn" data-act="close">Cancel</button><button class="k-btn" data-act="proof-skip">Done without proof</button><button class="k-btn pri" data-act="proof-save"' + (a.uploading ? ' disabled' : '') + '>' + (a.uploading ? 'Uploading…' : 'Save proof &amp; mark done') + '</button></div>';
   },
@@ -1098,7 +1100,7 @@ root.addEventListener('input', handleInput);
 root.addEventListener('keydown', function (e) { if (e.key === 'Escape' && UI.modal) closeModal(); });
 root.addEventListener('click', function (e) { if (e.target.id === 'k-modal') closeModal(); });
 document.addEventListener('paste', function (e) {
-  if (!UI.modal || UI.modal.kind !== 'proof') return;
+  if (!UI.modal || UI.modal.kind !== 'proof' || !CAN_UPLOAD) return;
   var items = (e.clipboardData || {}).items || [];
   for (var i = 0; i < items.length; i++) if (items[i].type.indexOf('image') === 0) { takeShot(items[i].getAsFile()); e.preventDefault(); return; }
 });

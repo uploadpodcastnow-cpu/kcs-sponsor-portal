@@ -9,7 +9,7 @@ This repo is separate from `tpu-report`.
 |---|---|
 | `app.js` | The whole portal: Month overview, Sponsors, Calendar, Tasks. Change the portal here; everyone gets the change the next time they open it. |
 | `index.html` | Hosts `app.js` as a standalone page (GitHub Pages), for embedding by URL. |
-| `apps-script/Code.gs` | The shared data store: a Google Apps Script web app that saves the board to one JSON file in Drive, keeps dated history copies, and stores proof screenshots. |
+| `apps-script/Code.gs` | The shared data store for the Assembly version: a Google Apps Script web app (in the uploadpodcastnow Google account) that keeps the board in the script's own storage plus the previous version. It needs no Drive access, so Google doesn't block it. Proof screenshots are added as links. |
 
 There is **no sponsor data in this repo**. The data lives in the TPU Google Drive.
 

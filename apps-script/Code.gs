@@ -1,32 +1,45 @@
 /**
  * Kirk Cameron Show Sponsorship Portal — shared data store.
  *
- * Paste this whole file into a new Google Apps Script project (script.google.com, signed in to the
- * TPU Google account), then: Deploy → New deployment → type "Web app" →
- *   Execute as: Me    Who has access: Anyone
- * Copy the web-app URL into the Assembly embed as KCS_API_URL.
+ * Keeps the board in this script's own storage (Script Properties). It needs no access to Drive, Gmail or
+ * anything else in the Google account, so Google does not block it.
  *
- * Before deploying, run setup() once from the editor (choose setup in the toolbar, click Run, allow access).
- * It creates the data file and the proof-screenshot folder in your Drive and prints a shared key —
- * put that key in the Assembly embed as KCS_API_KEY.
+ * Setup: paste this file into a new Apps Script project, run setup() once (it prints the shared key in the
+ * execution log), then Deploy → New deployment → Web app, set Execute as: Me and Who has access: Anyone.
+ * Put the web-app URL and the key in the embed link: …/kcs-sponsor-portal/#api=<URL>&key=<KEY>
  *
- * Data lives in one JSON file in Drive ("KCS Sponsor Portal — data.json"). Every save also keeps a dated
- * copy in the "KCS Sponsor Portal — history" folder (last 60 kept), so nothing is ever lost.
+ * The previous version is kept on every save, so one bad save can be undone with restorePrevious().
+ * Storage limit is about 450 KB of board data (today's board is about 90 KB).
  */
 
 var PROPS = PropertiesService.getScriptProperties();
+var CHUNK = 6000;
 
 function setup() {
-  var root = DriveApp.getRootFolder();
-  if (!PROPS.getProperty('DATA_FILE_ID')) {
-    var f = root.createFile('KCS Sponsor Portal — data.json', JSON.stringify({ schema: 1, sponsors: [] }), 'application/json');
-    PROPS.setProperty('DATA_FILE_ID', f.getId());
-  }
-  if (!PROPS.getProperty('PROOF_FOLDER_ID')) PROPS.setProperty('PROOF_FOLDER_ID', root.createFolder('KCS Sponsor Portal — proof screenshots').getId());
-  if (!PROPS.getProperty('HISTORY_FOLDER_ID')) PROPS.setProperty('HISTORY_FOLDER_ID', root.createFolder('KCS Sponsor Portal — history').getId());
   if (!PROPS.getProperty('KEY')) PROPS.setProperty('KEY', Utilities.getUuid().replace(/-/g, ''));
-  if (!PROPS.getProperty('VERSION')) PROPS.setProperty('VERSION', '1');
+  if (!PROPS.getProperty('VERSION')) { PROPS.setProperty('VERSION', '1'); writeData_('DATA', JSON.stringify({ schema: 1, sponsors: [] })); }
   Logger.log('Setup done. KCS_API_KEY = ' + PROPS.getProperty('KEY'));
+}
+
+function readData_(prefix) {
+  var n = +PROPS.getProperty(prefix + '_N') || 0, parts = [];
+  for (var i = 0; i < n; i++) parts.push(PROPS.getProperty(prefix + '_' + i) || '');
+  return parts.join('');
+}
+function writeData_(prefix, text) {
+  var old = +PROPS.getProperty(prefix + '_N') || 0, props = {}, n = Math.ceil(text.length / CHUNK) || 1;
+  for (var i = 0; i < n; i++) props[prefix + '_' + i] = text.slice(i * CHUNK, (i + 1) * CHUNK);
+  props[prefix + '_N'] = String(n);
+  PROPS.setProperties(props);
+  for (var j = n; j < old; j++) PROPS.deleteProperty(prefix + '_' + j);
+}
+
+function restorePrevious() {
+  var prev = readData_('PREV');
+  if (!prev) { Logger.log('No previous version saved.'); return; }
+  writeData_('DATA', prev);
+  PROPS.setProperty('VERSION', String((+PROPS.getProperty('VERSION') || 1) + 1));
+  Logger.log('Restored the previous version.');
 }
 
 function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
@@ -37,10 +50,9 @@ function doPost(e) {
   var body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return out_({ ok: false, error: 'Bad request' }); }
   if (!PROPS.getProperty('KEY') || body.key !== PROPS.getProperty('KEY')) return out_({ ok: false, error: 'Wrong key' });
-  var file = DriveApp.getFileById(PROPS.getProperty('DATA_FILE_ID'));
 
   if (body.action === 'load') {
-    return out_({ ok: true, data: JSON.parse(file.getBlob().getDataAsString() || '{}'), version: +PROPS.getProperty('VERSION') });
+    return out_({ ok: true, data: JSON.parse(readData_('DATA') || '{}'), version: +PROPS.getProperty('VERSION') });
   }
 
   if (body.action === 'save') {
@@ -49,38 +61,17 @@ function doPost(e) {
     try {
       var current = +PROPS.getProperty('VERSION');
       if (body.version !== current) {
-        return out_({ ok: false, conflict: true, data: JSON.parse(file.getBlob().getDataAsString() || '{}'), version: current });
+        return out_({ ok: false, conflict: true, data: JSON.parse(readData_('DATA') || '{}'), version: current });
       }
       var text = JSON.stringify(body.data);
-      file.setContent(text);
+      if (text.length > 220000) return out_({ ok: false, error: 'The board is too large for this store' });
+      writeData_('PREV', readData_('DATA'));
+      writeData_('DATA', text);
       var next = current + 1;
       PROPS.setProperty('VERSION', String(next));
-      keepHistory_(text);
       return out_({ ok: true, version: next });
     } finally { lock.releaseLock(); }
   }
 
-  if (body.action === 'upload') {
-    var m = String(body.dataUrl || '').match(/^data:(image\/[\w.+-]+);base64,(.+)$/);
-    if (!m) return out_({ ok: false, error: 'Not an image' });
-    var blob = Utilities.newBlob(Utilities.base64Decode(m[2]), m[1], (new Date()).toISOString().slice(0, 10) + ' ' + String(body.name || 'proof').slice(0, 80));
-    var img = DriveApp.getFolderById(PROPS.getProperty('PROOF_FOLDER_ID')).createFile(blob);
-    img.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-    return out_({ ok: true, url: 'https://drive.google.com/file/d/' + img.getId() + '/view' });
-  }
-
   return out_({ ok: false, error: 'Unknown action' });
-}
-
-// One copy per save, at most one per 10 minutes, newest 60 kept.
-function keepHistory_(text) {
-  var last = +PROPS.getProperty('LAST_HISTORY') || 0, now = Date.now();
-  if (now - last < 10 * 60 * 1000) return;
-  PROPS.setProperty('LAST_HISTORY', String(now));
-  var folder = DriveApp.getFolderById(PROPS.getProperty('HISTORY_FOLDER_ID'));
-  folder.createFile('data ' + new Date().toISOString().replace(/[:T]/g, '-').slice(0, 16) + '.json', text, 'application/json');
-  var files = [], it = folder.getFiles();
-  while (it.hasNext()) files.push(it.next());
-  files.sort(function (a, b) { return b.getDateCreated() - a.getDateCreated(); });
-  files.slice(60).forEach(function (f) { f.setTrashed(true); });
 }
