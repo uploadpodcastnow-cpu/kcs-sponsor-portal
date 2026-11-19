@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KCS Sponsorship Board</title>
+<style>body{margin:0;background:#fff}</style>
+</head>
+<body>
+<div id="kcs-portal"></div>
+<script>
+  // Used when Assembly embeds this page by URL (iframe). Settings come from the link:
+  //   https://uploadpodcastnow-cpu.github.io/kcs-sponsor-portal/#api=<Apps Script URL>&key=<shared key>
+  // Without them the board runs in "this browser only" mode.
+  (function () {
+    var h = new URLSearchParams(location.hash.slice(1));
+    if (h.get('api')) window.KCS_API_URL = h.get('api');
+    if (h.get('key')) window.KCS_API_KEY = h.get('key');
+  })();
+</script>
+<script src="app.js"></script>
+</body>
+</html>
