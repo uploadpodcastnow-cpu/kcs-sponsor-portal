@@ -129,15 +129,115 @@ function api(body) {
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
 }
 function load() {
-  if (!API) {
-    var raw = null; try { raw = localStorage.getItem(LS_DATA); } catch (e) {}
-    if (raw) { try { D = normalize(JSON.parse(raw)); } catch (e) { D = normalize(window.KCS_SEED ? clone(window.KCS_SEED) : null); } }
-    else D = normalize(window.KCS_SEED ? clone(window.KCS_SEED) : null);
-    return Promise.resolve();
+  if (API) {
+    return api({ action: 'load' }).then(function (r) {
+      if (!r.ok) throw new Error(r.error || 'Could not load');
+      D = normalize(r.data); version = r.version || 0;
+    });
   }
-  return api({ action: 'load' }).then(function (r) {
-    if (!r.ok) throw new Error(r.error || 'Could not load');
-    D = normalize(r.data); version = r.version || 0;
+  // Inside a Claude artifact: the shared database (also how Claude edits the board from chat).
+  if (window.claude && typeof window.claude.use === 'function') {
+    return window.claude.use('db').then(function (db) {
+      if (db) { DBH = db; return dbStart(db); }
+      loadLocal();
+    }, function () { loadLocal(); });
+  }
+  loadLocal(); return Promise.resolve();
+}
+function loadLocal() {
+  var raw = null; try { raw = localStorage.getItem(LS_DATA); } catch (e) {}
+  if (raw) { try { D = normalize(JSON.parse(raw)); return; } catch (e) {} }
+  D = normalize(window.KCS_SEED ? clone(window.KCS_SEED) : null);
+}
+
+/* ---- Claude artifact database ----
+   board/meta        team, deliverable types, recorded days, general tasks
+   sponsors/<id>     one sponsor with its own placements and tasks
+   One document per sponsor keeps edits small and lets two people work on different sponsors at once. */
+var DBH = null, dbDocs = {}, dbWriting = false, dbQueued = false, dbStash = null, needRender = false;
+function bundle() {
+  var out = {};
+  out['board/meta'] = { schema: 1, team: D.team, types: D.types, days: D.days, assetsHubLink: D.assetsHubLink || '', importedAt: D.importedAt || '',
+    generalTasks: D.tasks.filter(function (t) { return !t.sponsorId || !sponsor(t.sponsorId); }) };
+  D.sponsors.forEach(function (sp) {
+    var b = clone(sp);
+    b.placements = D.placements.filter(function (p) { return p.sponsorId === sp.id; });
+    b.tasks = D.tasks.filter(function (t) { return t.sponsorId === sp.id; });
+    out['sponsors/' + sp.id] = b;
+  });
+  return out;
+}
+function assemble(meta, docs) {
+  var d = { schema: 1, team: meta && meta.team, types: meta && meta.types, days: (meta && meta.days) || {}, assetsHubLink: (meta && meta.assetsHubLink) || '',
+    importedAt: (meta && meta.importedAt) || null, sponsors: [], placements: [], tasks: ((meta && meta.generalTasks) || []).slice() };
+  docs.forEach(function (x) {
+    var b = clone(x.data); b.id = b.id || x.id;
+    (b.placements || []).forEach(function (p) { p.sponsorId = b.id; d.placements.push(p); });
+    (b.tasks || []).forEach(function (t) { t.sponsorId = b.id; d.tasks.push(t); });
+    delete b.placements; delete b.tasks; d.sponsors.push(b);
+  });
+  return normalize(d);
+}
+function rememberDocs() { var b = bundle(); dbDocs = {}; Object.keys(b).forEach(function (k) { dbDocs[k] = JSON.stringify(b[k]); }); }
+function applyRemote(meta, docs) {
+  if (dirty || dbWriting) { dbStash = { meta: meta, docs: docs }; return; }
+  D = assemble(meta, docs); rememberDocs();
+  if (UI.modal) needRender = true; else if (root.querySelector('.k-top')) render();
+}
+function dbStart(db) {
+  return new Promise(function (resolve) {
+    var meta = null, docs = [], gotM = false, gotS = false, done = false;
+    var timer = setTimeout(function () { if (!done) { done = true; resolve(); toast('The board is slow to load — it may be out of date for a moment.'); } }, 10000);
+    function ready() {
+      if (!gotM || !gotS) return;
+      if (!done) {
+        done = true; clearTimeout(timer);
+        if (!meta && !docs.length) { D = blankData(); rememberDocs(); dbSeed(db).then(resolve, resolve); return; }
+        D = assemble(meta, docs); rememberDocs(); resolve(); return;
+      }
+      applyRemote(meta, docs);
+    }
+    function fail(e) { saveState = 'error'; lastError = 'Live updates stopped (' + ((e && e.code) || 'error') + '). Reload the page.'; paintSave(); if (!done) { done = true; clearTimeout(timer); resolve(); } }
+    db.doc('board/meta').onSnapshot(function (snap) { meta = snap.exists ? snap.data() : null; gotM = true; ready(); }, fail);
+    db.collection('sponsors').onSnapshot(function (q) { docs = q.docs.map(function (x) { return { id: x.id, data: x.data() }; }); gotS = true; ready(); }, fail);
+  });
+}
+// First open of an empty board: load the migrated data shipped beside the page (seed.json), once.
+function dbSeed(db) {
+  return fetch('seed.json').then(function (r) { if (!r.ok) throw 0; return r.json(); }).then(function (seed) {
+    return db.doc('board/seedlock').acquire({ holder: uid('seed'), ttlMs: 120000 }).then(function (lease) {
+      if (!lease.acquired) return;
+      return db.doc('board/meta').get().then(function (m) {
+        if (m.exists) return;
+        D = normalize(seed); save(); setTimeout(function () { toast('Loaded everything from the old board.'); }, 300);
+      });
+    });
+  }).catch(function () {});
+}
+function dbFlush() {
+  if (dbWriting) { dbQueued = true; return; }
+  dbWriting = true;
+  var want = bundle(), ops = [];
+  Object.keys(want).forEach(function (k) { var j = JSON.stringify(want[k]); if (dbDocs[k] !== j) ops.push([k, want[k], j]); });
+  Object.keys(dbDocs).forEach(function (k) { if (!(k in want)) ops.push([k, null, null]); });
+  var chain = Promise.resolve();
+  ops.forEach(function (o) {
+    chain = chain.then(function () {
+      var ref = DBH.doc(o[0]);
+      return (o[1] ? ref.set(o[1]) : ref.delete()).then(function () { if (o[1]) dbDocs[o[0]] = o[2]; else delete dbDocs[o[0]]; });
+    });
+  });
+  chain.then(function () {
+    dbWriting = false;
+    if (dbQueued) { dbQueued = false; dbFlush(); return; }
+    dirty = false; saveState = 'saved'; paintSave();
+    if (dbStash) { var st2 = dbStash; dbStash = null; applyRemote(st2.meta, st2.docs); }
+  }, function (e) {
+    dbWriting = false;
+    if (e && e.code === 'invalid_argument') { saveState = 'error'; lastError = 'Not saved — you have view-only access to this board.'; paintSave(); return; }
+    if (e && e.code === 'quota_exceeded') { saveState = 'error'; lastError = 'Not saved — the board is full (' + e.message + ').'; paintSave(); return; }
+    saveState = 'error'; lastError = 'Not saved — retrying…'; paintSave();
+    clearTimeout(saveTimer); saveTimer = setTimeout(dbFlush, 5000);
   });
 }
 function save() {
@@ -145,6 +245,7 @@ function save() {
   clearTimeout(saveTimer); saveTimer = setTimeout(flush, 700);
 }
 function flush() {
+  if (DBH) { dbFlush(); return; }
   if (!API) {
     try { localStorage.setItem(LS_DATA, JSON.stringify(D)); saveState = 'saved'; } catch (e) { saveState = 'error'; lastError = 'This browser would not save (storage full or blocked).'; }
     dirty = false; paintSave(); return;
@@ -336,7 +437,7 @@ function toast(msg) {
 function paintSave() {
   var el = root.querySelector('#k-save'); if (!el) return;
   el.className = 'k-save' + (saveState === 'error' ? ' err' : '');
-  el.textContent = saveState === 'saving' ? 'Saving…' : saveState === 'error' ? lastError : saveState === 'saved' ? 'All changes saved' : (API ? 'Shared board' : 'Saved in this browser only');
+  el.textContent = saveState === 'saving' ? 'Saving…' : saveState === 'error' ? lastError : saveState === 'saved' ? 'All changes saved' : (API || DBH ? 'Shared board — changes save for everyone' : 'Saved in this browser only');
 }
 
 /* ------------------------------------------------------------------ small renderers */
@@ -619,7 +720,7 @@ function viewTasks() {
 
 /* ------------------------------------------------------------------ modals */
 function openModal(kind, arg) { UI.modal = { kind: kind, arg: arg || {} }; renderModal(); }
-function closeModal() { UI.modal = null; var bg = document.getElementById('k-modal'); if (bg) bg.remove(); render(); }
+function closeModal() { UI.modal = null; needRender = false; var bg = document.getElementById('k-modal'); if (bg) bg.remove(); render(); }
 function renderModal() {
   var old = document.getElementById('k-modal'); if (old) old.remove();
   var md = UI.modal; if (!md) return;
@@ -1070,7 +1171,8 @@ function convertOldBoard(raw) {
       var def = DEFAULT_TYPES.filter(function (x) { return x.id === t.id; })[0];
       return { id: t.id || uid('ty'), name: t.name || 'Deliverable', owner: t.owner || '', proof: def ? def.proof : /story|email|newsletter/i.test(t.name || '') ? 'screenshot' : 'link', legacy: t };
     });
-    DEFAULT_TYPES.forEach(function (d) { if (!keepTypes.some(function (k) { return k.id === d.id; })) keepTypes.push(clone(d)); });
+    var norm = function (x) { return String(x).toLowerCase().replace(/[^a-z]/g, '').replace(/listing$/, ''); };
+    DEFAULT_TYPES.forEach(function (d) { if (!keepTypes.some(function (k) { return k.id === d.id || norm(k.name) === norm(d.name) || norm(k.name) === norm(d.name.replace(' — ', ' ')); })) keepTypes.push(clone(d)); });
     out.types = keepTypes;
   }
   function typeFor(idOrName) {
@@ -1083,7 +1185,8 @@ function convertOldBoard(raw) {
     var sid = o.id || uid('sp'), slots = (o.purchasedSlots || []).map(function (x) { return String(x).toLowerCase(); });
     var per = num(pick(o, ['adSpotsPerMonth', 'episodesPerMonth', 'spotsPerMonth']));
     var pkg = { episodesPerMonth: per, early: 0, mid: 0, late: 0, extras: [] };
-    slots.forEach(function (x) { var g = SLOT_GROUP[slotMap[x]] || (/early/.test(x) ? 'early' : /late/.test(x) ? 'late' : 'mid'); pkg[g] += per; });
+    var groups = {}; slots.forEach(function (x) { groups[SLOT_GROUP[slotMap[x]] || (/early/.test(x) ? 'early' : /late/.test(x) ? 'late' : 'mid')] = 1; });
+    Object.keys(groups).forEach(function (g) { pkg[g] = per; });
     if (!slots.length && per) pkg.mid = per;
     var start = pick(o, ['startDate', 'dealStartDate', 'contractStart']), months = num(o.contractMonths);
     var end = pick(o, ['dealEndDate', 'endDate']);
@@ -1125,10 +1228,14 @@ function convertOldBoard(raw) {
       var due = String(pick(t, ['dueDate', 'due', 'date']) || '').slice(0, 10);
       var tm = title.match(/ — ([A-Z][a-z]+) (\d{4})\b/), fromTitle = '';
       if (tm) { var dt = new Date(tm[1] + ' 1, ' + tm[2]); if (!isNaN(dt)) fromTitle = ymd(dt).slice(0, 7); }
-      var mo = String(pick(t, ['dueMonth', 'month']) || '').slice(0, 7) || (link && link.b.month ? String(link.b.month).slice(0, 7) : '') || fromTitle;
+      var dm = title.match(/ — ([A-Z][a-z]{2}) (\d{1,2}), (\d{4})/), fromDay = '';
+      if (dm) { var dd = new Date(dm[1] + ' ' + dm[2] + ', ' + dm[3]); if (!isNaN(dd)) fromDay = ymd(dd).slice(0, 7); }
+      var mo = String(pick(t, ['dueMonth', 'month']) || '').slice(0, 7) || (link && link.b.month ? String(link.b.month).slice(0, 7) : '') || fromTitle || fromDay;
+      var tyGuess = link ? link.ty : out.types.filter(function (x) { return title.indexOf(x.name + ' — ') === 0; })[0];
+      var split = /\(\d+ of \d+\)\s*$/.test(title);
       var stv = String(t.status || '').toLowerCase(), status = /done|complete/.test(stv) || t.done === true ? 'done' : /progress/.test(stv) ? 'progress' : 'open';
       var proofUrl = pick(t, ['proofLink', 'proofUrl', 'proof', 'link', 'url']);
-      out.tasks.push({ id: t.id || uid('task'), sponsorId: sid, month: mo, typeId: link ? link.ty.id : '', title: title, qty: link ? (num(link.b.quantity) || 1) : 1, owner: t.owner || '', due: due,
+      out.tasks.push({ id: t.id || uid('task'), sponsorId: sid, month: mo, typeId: tyGuess ? tyGuess.id : '', title: title, qty: link && !split ? (num(link.b.quantity) || 1) : 1, owner: t.owner || '', due: due,
         status: status, doneAt: t.completedAt || '', notes: [t.notes, (proofUrl && typeof proofUrl === 'string' && !isUrl(proofUrl)) ? proofUrl : ''].filter(Boolean).join(' · '),
         proof: proofUrl && isUrl(proofUrl) ? { url: proofUrl, image: '', note: '', at: t.completedAt || '' } : null, custom: !!bespokeIds[t.id], legacy: t });
       stat.tk++;

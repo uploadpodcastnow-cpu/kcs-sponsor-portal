@@ -26,7 +26,13 @@ There is **no sponsor data in this repo**. The data lives in the TPU Google Driv
 
 Footer → **Backup & import** → choose the backup downloaded from the old board. Everything carries over: sponsors, deals, contacts, colors, every placement with slot and format, recorded dates, bookings, all tasks with status, owner, due date and notes, the team, and deliverable types. The original backup file is also stored inside the portal (`archive`).
 
-## Setup (one time)
+## Where the live board runs
+
+The live board is the private Claude artifact **KCS Sponsorship Board**. Its data is in that artifact's shared database, already filled with everything from the old board. Share it with the TPU team from its Share menu. Changes can also be made by asking Claude in the TPU Sponsorship Acquisition project (see `CLAUDE.md`).
+
+The Google Apps Script setup below is only needed if the board must run inside Assembly instead.
+
+## Setup for Assembly (optional)
 
 1. **Data store.** Signed in to the TPU Google account, go to script.google.com → New project and paste in `apps-script/Code.gs`. Run `setup` once and allow access. The log prints a key. Then Deploy → New deployment → Web app, set *Execute as: Me* and *Who has access: Anyone*, and copy the URL.
 2. **Assembly.** Add a custom app or embed with:
